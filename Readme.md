@@ -91,3 +91,11 @@ If a subset feature or a bug fix in this staging branch could meet below require
 4. Redfish Schemas - https://redfish.dmtf.org/schemas/v1/
 
 5. UEFI Specification - http://uefi.org/specifications
+
+# EDK2 Redfish POC Code re-architecture Project
+Intel Redfish POC Code Rearchitecture.pdf (under branch root) is uploaded as the reference. This proposal has discussed in TianoCore design meeting and the goal of re-architecture project is to make edk2 Redfish support more flexible and easier to be integrated to OEM edk2 code base.
+HPE is making code changes on this branch based on the proposal. 
+
+## The opinions from TianoCore community against to the proposal
+- Still use protocol for Redfish credential on edk2, instead of using the library instance mentioned in the re-architecture proposal.
+- REST EX shouldn't have the dependency of platform-specific protocol. Use library instance for platform-specific implementation and OEM deals with the dependency, opensource use NULL lib instance which has no dependencies with other protocols.
