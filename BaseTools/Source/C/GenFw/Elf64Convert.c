@@ -3,6 +3,7 @@ Elf64 convert solution
 
 Copyright (c) 2010 - 2018, Intel Corporation. All rights reserved.<BR>
 Portions copyright (c) 2013-2014, ARM Ltd. All rights reserved.<BR>
+Portions Copyright (c) 2016 - 2019 Hewlett Packard Enterprise Development LP. All rights reserved.<BR>
 
 SPDX-License-Identifier: BSD-2-Clause-Patent
 
@@ -30,6 +31,12 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 #include "GenFw.h"
 #include "ElfConvert.h"
 #include "Elf64Convert.h"
+
+#define RV_X(x, s, n) (((x) >> (s)) & ((1<<(n))-1))
+#define RISCV_IMM_BITS 12
+#define RISCV_IMM_REACH (1LL<<RISCV_IMM_BITS)
+#define RISCV_CONST_HIGH_PART(VALUE) \
+  (((VALUE) + (RISCV_IMM_REACH/2)) & ~(RISCV_IMM_REACH-1))
 
 STATIC
 VOID
@@ -153,8 +160,8 @@ InitializeElf64 (
     Error (NULL, 0, 3000, "Unsupported", "ELF e_type not ET_EXEC or ET_DYN");
     return FALSE;
   }
-  if (!((mEhdr->e_machine == EM_X86_64) || (mEhdr->e_machine == EM_AARCH64))) {
-    Error (NULL, 0, 3000, "Unsupported", "ELF e_machine not EM_X86_64 or EM_AARCH64");
+  if (!((mEhdr->e_machine == EM_X86_64) || (mEhdr->e_machine == EM_AARCH64) || (mEhdr->e_machine == EM_RISCV64))) {
+    Error (NULL, 0, 3000, "Unsupported", "ELF e_machine is not Elf64 machine.");
     return FALSE;
   }
   if (mEhdr->e_version != EV_CURRENT) {
@@ -481,6 +488,7 @@ ScanSections64 (
   switch (mEhdr->e_machine) {
   case EM_X86_64:
   case EM_AARCH64:
+  case EM_RISCV64:
     mCoffOffset += sizeof (EFI_IMAGE_NT_HEADERS64);
   break;
   default:
@@ -690,6 +698,11 @@ ScanSections64 (
     NtHdr->Pe32Plus.FileHeader.Machine = EFI_IMAGE_MACHINE_AARCH64;
     NtHdr->Pe32Plus.OptionalHeader.Magic = EFI_IMAGE_NT_OPTIONAL_HDR64_MAGIC;
     break;
+  case EM_RISCV64:
+    NtHdr->Pe32Plus.FileHeader.Machine = EFI_IMAGE_MACHINE_RISCV64;
+    NtHdr->Pe32Plus.OptionalHeader.Magic = EFI_IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    break;
+
   default:
     VerboseMsg ("%s unknown e_machine type. Assume X64", (UINTN)mEhdr->e_machine);
     NtHdr->Pe32Plus.FileHeader.Machine = EFI_IMAGE_MACHINE_X64;
@@ -769,6 +782,11 @@ WriteSections64 (
   Elf_Shdr    *SecShdr;
   UINT32      SecOffset;
   BOOLEAN     (*Filter)(Elf_Shdr *);
+  UINT32      Value;
+  UINT32      Value2;
+  UINT8       *Pass1Targ = NULL;
+  Elf_Shdr    *Pass1Sym = NULL;
+  Elf64_Half  Pass1SymSecIndex = 0;
   Elf64_Addr  GOTEntryRva;
 
   //
@@ -893,13 +911,14 @@ WriteSections64 (
           if (SymName == NULL) {
             SymName = (const UINT8 *)"<unknown>";
           }
+          if (mEhdr->e_machine != EM_RISCV64) {
+            Error (NULL, 0, 3000, "Invalid",
+                   "%s: Bad definition for symbol '%s'@%#llx or unsupported symbol type.  "
+                   "For example, absolute and undefined symbols are not supported.",
+                   mInImageName, SymName, Sym->st_value);
 
-          Error (NULL, 0, 3000, "Invalid",
-                 "%s: Bad definition for symbol '%s'@%#llx or unsupported symbol type.  "
-                 "For example, absolute and undefined symbols are not supported.",
-                 mInImageName, SymName, Sym->st_value);
-
-          exit(EXIT_FAILURE);
+            exit(EXIT_FAILURE);
+          }
         }
         SymShdr = GetShdrByIndex(Sym->st_shndx);
 
@@ -1114,6 +1133,128 @@ WriteSections64 (
           default:
             Error (NULL, 0, 3000, "Invalid", "WriteSections64(): %s unsupported ELF EM_AARCH64 relocation 0x%x.", mInImageName, (unsigned) ELF_R_TYPE(Rel->r_info));
           }
+        } else if (mEhdr->e_machine == EM_RISCV64) {
+          switch (ELF_R_TYPE(Rel->r_info)) {
+          case R_RISCV_NONE:
+            break;
+          case R_RISCV_32:
+            *(UINT32 *)Targ = (UINT32)((UINT64)(*(UINT32 *)Targ) - SymShdr->sh_addr + mCoffSectionsOffset[Sym->st_shndx]);
+            break;
+          case R_RISCV_64:
+            *(UINT64 *)Targ = *(UINT64 *)Targ - SymShdr->sh_addr + mCoffSectionsOffset[Sym->st_shndx];
+            break;
+          case R_RISCV_HI20:
+              Pass1Targ = Targ;
+              Pass1Sym = SymShdr;
+              Pass1SymSecIndex = Sym->st_shndx;
+            break;
+          case R_RISCV_LO12_I:
+            if (Pass1Sym == SymShdr && Pass1Targ != NULL && Pass1SymSecIndex == Sym->st_shndx && Pass1SymSecIndex != 0) {
+              Value = (UINT32)(RV_X(*(UINT32 *)Pass1Targ, 12, 20) << 12);
+              Value2 = (UINT32)(RV_X(*(UINT32 *)Targ, 20, 12));
+              if (Value2 & (RISCV_IMM_REACH/2)) {
+                Value2 |= ~(RISCV_IMM_REACH-1);
+              }
+              Value += Value2;
+              Value = Value - SymShdr->sh_addr + mCoffSectionsOffset[Sym->st_shndx];
+              Value2 = RISCV_CONST_HIGH_PART (Value);
+              *(UINT32 *)Pass1Targ = (RV_X (Value2, 12, 20) << 12) | \
+                                         (RV_X (*(UINT32 *)Pass1Targ, 0, 12));
+              *(UINT32 *)Targ = (RV_X (Value, 0, 12) << 20) | \
+                                (RV_X (*(UINT32 *)Targ, 0, 20));
+            }
+            Pass1Sym = NULL;
+            Pass1Targ = NULL;
+            Pass1SymSecIndex = 0;
+            break;
+
+          case R_RISCV_LO12_S:
+            if (Pass1Sym == SymShdr && Pass1Targ != NULL && Pass1SymSecIndex == Sym->st_shndx && Pass1SymSecIndex != 0) {
+              Value = (UINT32)(RV_X(*(UINT32 *)Pass1Targ, 12, 20) << 12);
+              Value2 = (UINT32)(RV_X(*(UINT32 *)Targ, 7, 5) | (RV_X(*(UINT32 *)Targ, 25, 7) << 5));
+              if (Value2 & (RISCV_IMM_REACH/2)) {
+                Value2 |= ~(RISCV_IMM_REACH-1);
+              }
+              Value += Value2;
+              Value = Value - SymShdr->sh_addr + mCoffSectionsOffset[Sym->st_shndx];
+              Value2 = RISCV_CONST_HIGH_PART (Value);
+              *(UINT32 *)Pass1Targ = (RV_X (Value2, 12, 20) << 12) | \
+                                         (RV_X (*(UINT32 *)Pass1Targ, 0, 12));
+
+              Value2 = *(UINT32 *)Targ & 0x01fff07f;
+              Value &= RISCV_IMM_REACH - 1;
+              *(UINT32 *)Targ = Value2 | (UINT32)(((RV_X(Value, 0, 5) << 7) | (RV_X(Value, 5, 7) << 25)));
+            }
+            Pass1Sym = NULL;
+            Pass1Targ = NULL;
+            Pass1SymSecIndex = 0;
+            break;
+
+          case R_RISCV_PCREL_HI20:
+            Pass1Targ = Targ;
+            Pass1Sym = SymShdr;
+            Pass1SymSecIndex = Sym->st_shndx;
+
+            Value = (UINT32)(RV_X(*(UINT32 *)Pass1Targ, 12, 20));
+            break;
+          case R_RISCV_PCREL_LO12_I:
+            if (Pass1Targ != NULL && Pass1Sym != NULL && Pass1SymSecIndex != 0) {
+              int i;
+              Value2 = (UINT32)(RV_X(*(UINT32 *)Pass1Targ, 12, 20));
+              Value = (UINT32)(RV_X(*(UINT32 *)Targ, 20, 12));
+              if(Value & (RISCV_IMM_REACH/2)) {
+                Value |= ~(RISCV_IMM_REACH-1);
+              }
+              Value = Value - Pass1Sym->sh_addr + mCoffSectionsOffset[Pass1SymSecIndex];
+              if(-2048 > (INT32)Value) {
+                i = (-Value / 4096);
+                Value2 -= i;
+                Value += 4096 * i;
+                if(-2048 > (INT32)Value) {
+                  Value2 -= 1;
+                  Value += 4096;
+                }
+              }
+              else if( 2047 < (INT32)Value) {
+                i = (Value / 4096);
+                Value2 += i;
+                Value -= 4096 * i;
+                if(2047 < (INT32)Value) {
+                  Value2 += 1;
+                  Value -= 4096;
+                }
+              }
+
+              *(UINT32 *)Targ = (RV_X(Value, 0, 12) << 20) | (RV_X(*(UINT32*)Targ, 0, 20));
+              *(UINT32 *)Pass1Targ = (RV_X(Value2, 0, 20)<<12) | (RV_X(*(UINT32 *)Pass1Targ, 0, 12));
+            }
+            Pass1Sym = NULL;
+            Pass1Targ = NULL;
+            Pass1SymSecIndex = 0;
+            break;
+
+          case R_RISCV_ADD64:
+          case R_RISCV_SUB64:
+          case R_RISCV_ADD32:
+          case R_RISCV_SUB32:
+          case R_RISCV_BRANCH:
+          case R_RISCV_JAL:
+          case R_RISCV_GPREL_I:
+          case R_RISCV_GPREL_S:
+          case R_RISCV_CALL:
+          case R_RISCV_RVC_BRANCH:
+          case R_RISCV_RVC_JUMP:
+          case R_RISCV_RELAX:
+          case R_RISCV_SUB6:
+          case R_RISCV_SET6:
+          case R_RISCV_SET8:
+          case R_RISCV_SET16:
+          case R_RISCV_SET32:
+            break;
+
+          default:
+            Error (NULL, 0, 3000, "Invalid", "WriteSections64(): %s unsupported ELF EM_RISCV64 relocation 0x%x.", mInImageName, (unsigned) ELF_R_TYPE(Rel->r_info));
+          }
         } else {
           Error (NULL, 0, 3000, "Invalid", "Not a supported machine type");
         }
@@ -1133,6 +1274,7 @@ WriteRelocations64 (
   UINT32                           Index;
   EFI_IMAGE_OPTIONAL_HEADER_UNION  *NtHdr;
   EFI_IMAGE_DATA_DIRECTORY         *Dir;
+  UINT32 RiscVRelType;
 
   for (Index = 0; Index < mEhdr->e_shnum; Index++) {
     Elf_Shdr *RelShdr = GetShdrByIndex(Index);
@@ -1236,6 +1378,108 @@ WriteRelocations64 (
 
             default:
                 Error (NULL, 0, 3000, "Invalid", "WriteRelocations64(): %s unsupported ELF EM_AARCH64 relocation 0x%x.", mInImageName, (unsigned) ELF_R_TYPE(Rel->r_info));
+            }
+          } else if (mEhdr->e_machine == EM_RISCV64) {
+            RiscVRelType = ELF_R_TYPE(Rel->r_info);
+            switch (RiscVRelType) {
+            case R_RISCV_NONE:
+              break;
+
+            case R_RISCV_32:
+              CoffAddFixup(
+                (UINT32) ((UINT64) mCoffSectionsOffset[RelShdr->sh_info]
+                + (Rel->r_offset - SecShdr->sh_addr)),
+                EFI_IMAGE_REL_BASED_HIGHLOW);
+              break;
+
+            case R_RISCV_64:
+              CoffAddFixup(
+                (UINT32) ((UINT64) mCoffSectionsOffset[RelShdr->sh_info]
+                + (Rel->r_offset - SecShdr->sh_addr)),
+                EFI_IMAGE_REL_BASED_DIR64);
+              break;
+
+            case R_RISCV_HI20:
+              CoffAddFixup(
+                (UINT32) ((UINT64) mCoffSectionsOffset[RelShdr->sh_info]
+                + (Rel->r_offset - SecShdr->sh_addr)),
+                EFI_IMAGE_REL_BASED_RISCV_HI20);
+              break;
+
+            case R_RISCV_LO12_I:
+              CoffAddFixup(
+                (UINT32) ((UINT64) mCoffSectionsOffset[RelShdr->sh_info]
+                + (Rel->r_offset - SecShdr->sh_addr)),
+                EFI_IMAGE_REL_BASED_RISCV_LOW12I);
+              break;
+
+            case R_RISCV_LO12_S:
+              CoffAddFixup(
+                (UINT32) ((UINT64) mCoffSectionsOffset[RelShdr->sh_info]
+                + (Rel->r_offset - SecShdr->sh_addr)),
+                EFI_IMAGE_REL_BASED_RISCV_LOW12S);
+              break;
+
+            case R_RISCV_ADD64:
+              CoffAddFixup(
+                (UINT32) ((UINT64) mCoffSectionsOffset[RelShdr->sh_info]
+                + (Rel->r_offset - SecShdr->sh_addr)),
+                EFI_IMAGE_REL_BASED_ABSOLUTE);
+              break;
+
+            case R_RISCV_SUB64:
+              CoffAddFixup(
+                (UINT32) ((UINT64) mCoffSectionsOffset[RelShdr->sh_info]
+                + (Rel->r_offset - SecShdr->sh_addr)),
+                EFI_IMAGE_REL_BASED_ABSOLUTE);
+              break;
+
+            case R_RISCV_ADD32:
+              CoffAddFixup(
+                (UINT32) ((UINT64) mCoffSectionsOffset[RelShdr->sh_info]
+                + (Rel->r_offset - SecShdr->sh_addr)),
+                EFI_IMAGE_REL_BASED_ABSOLUTE);
+              break;
+
+            case R_RISCV_SUB32:
+              CoffAddFixup(
+                (UINT32) ((UINT64) mCoffSectionsOffset[RelShdr->sh_info]
+                + (Rel->r_offset - SecShdr->sh_addr)),
+                EFI_IMAGE_REL_BASED_ABSOLUTE);
+              break;
+
+            case R_RISCV_BRANCH:
+              CoffAddFixup(
+                (UINT32) ((UINT64) mCoffSectionsOffset[RelShdr->sh_info]
+                + (Rel->r_offset - SecShdr->sh_addr)),
+                EFI_IMAGE_REL_BASED_ABSOLUTE);
+              break;
+
+            case R_RISCV_JAL:
+              CoffAddFixup(
+                (UINT32) ((UINT64) mCoffSectionsOffset[RelShdr->sh_info]
+                + (Rel->r_offset - SecShdr->sh_addr)),
+                EFI_IMAGE_REL_BASED_ABSOLUTE);
+              break;
+
+            case R_RISCV_GPREL_I:
+            case R_RISCV_GPREL_S:
+            case R_RISCV_CALL:
+            case R_RISCV_RVC_BRANCH:
+            case R_RISCV_RVC_JUMP:
+            case R_RISCV_RELAX:
+            case R_RISCV_SUB6:
+            case R_RISCV_SET6:
+            case R_RISCV_SET8:
+            case R_RISCV_SET16:
+            case R_RISCV_SET32:
+            case R_RISCV_PCREL_HI20:
+            case R_RISCV_PCREL_LO12_I:
+              break;
+
+            default:
+              printf ("Unsupported RISCV64 ELF relocation type 0x%x, offset: %lx\n", RiscVRelType, Rel->r_offset);
+              Error (NULL, 0, 3000, "Invalid", "WriteRelocations64(): %s unsupported ELF EM_RISCV64 relocation 0x%x.", mInImageName, (unsigned) ELF_R_TYPE(Rel->r_info));
             }
           } else {
             Error (NULL, 0, 3000, "Not Supported", "This tool does not support relocations for ELF with e_machine %u (processor type).", (unsigned) mEhdr->e_machine);
