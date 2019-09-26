@@ -1478,7 +1478,7 @@ WriteRelocations64 (
               break;
 
             default:
-              printf ("Unsupported RISCV64 ELF relocation type 0x%x, offset: %llx\n", RiscVRelType, Rel->r_offset);
+              printf ("Unsupported RISCV64 ELF relocation type 0x%x, offset: %lx\n", RiscVRelType, Rel->r_offset);
               Error (NULL, 0, 3000, "Invalid", "WriteRelocations64(): %s unsupported ELF EM_RISCV64 relocation 0x%x.", mInImageName, (unsigned) ELF_R_TYPE(Rel->r_info));
             }
           } else {
